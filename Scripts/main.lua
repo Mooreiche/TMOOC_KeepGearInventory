@@ -2,7 +2,7 @@ local UEHelpers = require("UEHelpers")
 
 local LOG_PATH =
     "C:/Program Files (x86)/Steam/steamapps/common/The Mound/TheMound/Binaries/Win64/ue4ss/Mods/" ..
-    "Moor_KeepGerInventory/Moor_KeepGerInventory.log"
+    "TMOOC_KeepGearInventory-main/TMOOC_KeepGearInventory-main.log"
 
 local PLAYER_STATE_CLASS = "/Game/TheMound/Blueprints/Game/BP_TMPlayerState.BP_TMPlayerState_C"
 local LastRaidInventory = nil
@@ -24,7 +24,7 @@ local ALLOWED_OTHER_ITEM_MARKERS = {
 
 local function Log(message)
     local line = os.date("%Y-%m-%d %H:%M:%S") ..
-        " [Moor_KeepGerInventory] " .. tostring(message)
+        " [TMOOC_KeepGearInventory-main] " .. tostring(message)
     print(line .. "\n")
     local file = io.open(LOG_PATH, "a")
     if file then
@@ -341,7 +341,7 @@ end
 
 local session = io.open(LOG_PATH, "w")
 if session then
-    session:write("Moor_KeepGerInventory session started " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+    session:write("TMOOC_KeepGearInventory-main session started " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
     session:close()
 end
 
