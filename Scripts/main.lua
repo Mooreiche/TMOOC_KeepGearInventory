@@ -8,12 +8,14 @@ local PLAYER_STATE_CLASS = "/Game/TheMound/Blueprints/Game/BP_TMPlayerState.BP_T
 local LastRaidInventory = nil
 local WasInRaid = false
 local DiedThisRaid = false
+local InMasterMap = false
 local RestoreScheduled = false
 local RestoreAttempts = 0
 local DeathHookRegistered = false
 local NativeStoreItemPaths = {}
 local NativeTreasureItemPaths = {}
 local ItemKeepCache = {}
+local ItemInfoCache = {}
 local LastCatalogGameState = nil
 
 local ALLOWED_OTHER_ITEM_MARKERS = {
@@ -91,6 +93,7 @@ local function RefreshNativeItemSets()
         falseTreasureCount ~= nil and falseTreasureCount > 0 then
         LastCatalogGameState = gameStateName
         ItemKeepCache = {}
+        ItemInfoCache = {}
     end
 end
 
@@ -128,6 +131,22 @@ local function ShouldKeepItem(item, fullName, path)
         isAllowedOther or NativeStoreItemPaths[path] == true
     ItemKeepCache[path] = keep
     return keep
+end
+
+local function CachedItemInfo(item)
+    if not IsValid(item) then return nil end
+    local key = tostring(item)
+    local cached = ItemInfoCache[key]
+    if cached ~= nil then return cached end
+
+    local fullName = ObjectName(item)
+    local path = fullName:match("^[^ ]+ (.+)$") or fullName
+    local info = {
+        Path = path,
+        Keep = ShouldKeepItem(item, fullName, path),
+    }
+    ItemInfoCache[key] = info
+    return info
 end
 
 local function FindOrLoadAsset(path)
@@ -210,11 +229,10 @@ local function ReadTravelBagInventory()
             local amount = 0
             pcall(function() item = entry.Item end)
             pcall(function() amount = tonumber(entry.Count) or 0 end)
-            local fullName = ObjectName(item)
-            local path = fullName:match("^[^ ]+ (.+)$") or fullName
-            if ShouldKeepItem(item, fullName, path) and amount > 0 then
+            local info = CachedItemInfo(item)
+            if info ~= nil and info.Keep and amount > 0 then
                 table.insert(records, {
-                    Path = path,
+                    Path = info.Path,
                     Count = amount,
                     Slot = index,
                 })
@@ -314,18 +332,32 @@ local function RestoreRaidInventory()
     end)
 end
 
+local function CaptureRaidInventory()
+    if DiedThisRaid then return end
+    local snapshot = ReadTravelBagInventory()
+    if snapshot ~= nil and next(snapshot) ~= nil then
+        LastRaidInventory = snapshot
+        WasInRaid = true
+    end
+end
+
 local function MonitorExtractionTransition()
     ExecuteInGameThread(function()
         local worldName = ObjectName(UEHelpers.GetWorld())
-        if string.find(worldName, "MasterMap", 1, true) then
-            if not DiedThisRaid then
-                local snapshot = ReadTravelBagInventory()
-                if snapshot ~= nil and next(snapshot) ~= nil then
-                    LastRaidInventory = snapshot
-                    WasInRaid = true
-                end
+        local isMasterMap = string.find(worldName, "MasterMap", 1, true) ~= nil
+        local isGalleon = string.find(worldName, "Galleon", 1, true) ~= nil
+
+        if isMasterMap then
+            if not InMasterMap then
+                InMasterMap = true
+                CaptureRaidInventory()
             end
-        elseif string.find(worldName, "Galleon", 1, true) then
+        elseif InMasterMap then
+            CaptureRaidInventory()
+            InMasterMap = false
+        end
+
+        if isGalleon then
             if DiedThisRaid then
                 DiedThisRaid = false
             elseif WasInRaid and LastRaidInventory ~= nil and not RestoreScheduled then
@@ -339,6 +371,13 @@ local function MonitorExtractionTransition()
     ExecuteWithDelay(1000, MonitorExtractionTransition)
 end
 
+local function MonitorRaidInventory()
+    ExecuteInGameThread(function()
+        if InMasterMap then CaptureRaidInventory() end
+    end)
+    ExecuteWithDelay(5000, MonitorRaidInventory)
+end
+
 local session = io.open(LOG_PATH, "w")
 if session then
     session:write("TMOOC_KeepGearInventory-main session started " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
@@ -346,5 +385,6 @@ if session then
 end
 
 MonitorExtractionTransition()
+MonitorRaidInventory()
 RegisterDeathHook()
 Log("Loaded (production mode).")
