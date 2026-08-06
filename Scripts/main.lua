@@ -7,21 +7,23 @@ local LastRaidInventory = nil
 local WasInRaid = false
 local RestoreScheduled = false
 local RestoreAttempts = 0
+local RaidPlayerController = nil
+local RaidInventoryComponent = nil
+local RestorePlayerController = nil
+local RestoreInventoryComponent = nil
 local NativeStoreItemPaths = {}
 local NativeTreasureItemPaths = {}
 local ItemKeepCache = {}
 local LastCatalogGameState = nil
 local LastCatalogRefreshAt = 0
 local NormalizedEquipmentLog = {}
-local SAFETY_SNAPSHOT_INTERVAL_MS = 5000
-local POST_TRAVEL_CHECK_DELAYS_MS = { 1000, 2500, 5000, 9000 }
 
 -- Items in Pickups/Other mix real equipment with quest/special objects.  Only
 -- these asset-name fragments belong to the requested Tools & Artifacts or
 -- Support categories.
 local ALLOWED_OTHER_ITEM_MARKERS = {
     "DiviningRod", "Yig", "CurseJar", "Ichor", "Nyarlathotep", "Mask",
-    "Crucifix", "Medallion", "SoundBowl", "SlaveFinder", "SmellingSalts",
+    "Crucifix", "Medallion", "SoundBowl", "SlaveFinder",
     "Ammonia", "Map_", "Lantern",
 }
 
@@ -112,6 +114,13 @@ local function ShouldKeepItem(item, fullName, path)
         return false
     end
 
+    -- This special pickup crashes the listen server when reconstructed with
+    -- ServerAddItemToInventory after extraction.
+    if string.find(path, "SmellingSalts", 1, true) ~= nil then
+        ItemKeepCache[path] = false
+        return false
+    end
+
     local isWeapon = string.find(path, "/Blueprints/Pawn/Weapons/", 1, true) ~= nil
     local isArmor = string.find(path, "/Blueprints/Pawn/Armor/", 1, true) ~= nil
     local isAmmo = string.find(fullName, "ZCItemAmmo ", 1, true) == 1 or
@@ -175,6 +184,19 @@ local function CurrentWorld()
     return UEHelpers.GetWorld()
 end
 
+local function IsLocalPlayerController(controller)
+    if not IsValid(controller) then return false end
+    local isLocal = false
+    pcall(function() isLocal = controller:IsLocalPlayerController() end)
+    return isLocal == true
+end
+
+local function ControllerWorldName(controller)
+    local world = nil
+    if IsValid(controller) then pcall(function() world = controller:GetWorld() end) end
+    return ObjectName(world)
+end
+
 local function CurrentInventoryComponent()
     local pc = CurrentPlayerController()
     local inventory = nil
@@ -182,9 +204,10 @@ local function CurrentInventoryComponent()
     return inventory
 end
 
-local function ReadTravelBagInventory()
+local function ReadTravelBagInventory(inventoryOverride)
     RefreshNativeItemSets()
-    local inventory = CurrentInventoryComponent()
+    local inventory = inventoryOverride
+    if not IsValid(inventory) then inventory = CurrentInventoryComponent() end
     if not IsValid(inventory) then return nil end
 
     local array = nil
@@ -286,36 +309,49 @@ local function RemoveInventoryRecords(ps, records)
 end
 
 local function AddInventoryRecords(ps, records, prefix)
-    for _, record in ipairs(SortedInventoryRecords(records)) do
-        local asset = FindOrLoadAsset(record.Path)
-        if IsValid(asset) and record.Count > 0 then
-            local ok, err = pcall(function()
-                ps:ServerAddItemToInventory(asset, record.Count)
-            end)
-            Log((ok and prefix or "RESTORE add failed ") ..
-                "slot=" .. tostring(record.Slot) .. " " .. record.Path ..
-                " x" .. tostring(record.Count) .. (ok and "" or (" error=" .. tostring(err))))
-        else
-            Log("RESTORE asset unavailable " .. record.Path)
-        end
+    local delay = 50
+    for _, sourceRecord in ipairs(SortedInventoryRecords(records)) do
+        local record = {
+            Path = sourceRecord.Path,
+            Count = sourceRecord.Count,
+            Slot = sourceRecord.Slot,
+        }
+        ExecuteWithDelay(delay, function()
+            local asset = FindOrLoadAsset(record.Path)
+            if IsValid(asset) and record.Count > 0 then
+                local ok, err = pcall(function()
+                    ps:ServerAddItemToInventory(asset, record.Count)
+                end)
+                Log((ok and prefix or "RESTORE add failed ") ..
+                    "slot=" .. tostring(record.Slot) .. " " .. record.Path ..
+                    " x" .. tostring(record.Count) ..
+                    (ok and "" or (" error=" .. tostring(err))))
+            else
+                Log("RESTORE asset unavailable " .. record.Path)
+            end
+        end)
+        delay = delay + 250
     end
+    return delay
 end
 
 local function AddMissingInventoryRecords(ps, current, expected)
     local availableCounts = InventoryCounts(current)
+    local missingRecords = {}
     for _, record in ipairs(SortedInventoryRecords(expected)) do
         local available = availableCounts[record.Path] or 0
         local covered = math.min(available, record.Count)
         availableCounts[record.Path] = available - covered
         local missing = record.Count - covered
         if missing > 0 then
-            AddInventoryRecords(ps, { {
+            table.insert(missingRecords, {
                 Path = record.Path,
                 Count = missing,
                 Slot = record.Slot,
-            } }, "RESTORE added missing ")
+            })
         end
     end
+    return AddInventoryRecords(ps, missingRecords, "RESTORE added missing ")
 end
 
 local function RestoreRaidInventory()
@@ -324,10 +360,15 @@ local function RestoreRaidInventory()
         return
     end
 
-    local pc = CurrentPlayerController()
+    local pc = RestorePlayerController
+    if not IsValid(pc) then pc = CurrentPlayerController() end
     local ps = nil
     if IsValid(pc) then pcall(function() ps = pc.PlayerState end) end
-    local current = ReadTravelBagInventory()
+    local inventory = RestoreInventoryComponent
+    if not IsValid(inventory) and IsValid(pc) then
+        pcall(function() inventory = pc.InventoryComponent end)
+    end
+    local current = ReadTravelBagInventory(inventory)
     if not IsValid(ps) or current == nil then
         Log("RESTORE waiting for ship inventory")
         ExecuteWithDelay(1000, RestoreRaidInventory)
@@ -347,8 +388,9 @@ local function RestoreRaidInventory()
         AddMissingInventoryRecords(ps, current, LastRaidInventory)
     end
 
-    ExecuteWithDelay(1000, function()
-        local result = ReadTravelBagInventory()
+    local restoreSettleDelay = 1500 + (#LastRaidInventory * 250)
+    ExecuteWithDelay(restoreSettleDelay, function()
+        local result = ReadTravelBagInventory(inventory)
         Log("RESTORE result=" .. InventorySummary(result))
         if InventoryContains(result, LastRaidInventory) then
             Log("RESTORE complete")
@@ -356,6 +398,10 @@ local function RestoreRaidInventory()
             WasInRaid = false
             RestoreScheduled = false
             RestoreAttempts = 0
+            RaidPlayerController = nil
+            RaidInventoryComponent = nil
+            RestorePlayerController = nil
+            RestoreInventoryComponent = nil
         elseif RestoreAttempts < 5 then
             RestoreAttempts = RestoreAttempts + 1
             Log("RESTORE retry=" .. tostring(RestoreAttempts))
@@ -369,8 +415,8 @@ local function RestoreRaidInventory()
     end)
 end
 
-local function SaveRaidSnapshot(reason)
-    local snapshot = ReadTravelBagInventory()
+local function SaveRaidSnapshot(reason, inventoryOverride)
+    local snapshot = ReadTravelBagInventory(inventoryOverride)
     if snapshot ~= nil and next(snapshot) ~= nil then
         LastRaidInventory = snapshot
         WasInRaid = true
@@ -387,48 +433,42 @@ local function SaveRaidSnapshot(reason)
     return false
 end
 
-local function CheckExtractionTransition()
-    ExecuteInGameThread(function()
-        local worldName = ObjectName(CurrentWorld())
-        if string.find(worldName, "MasterMap", 1, true) then
-            SaveRaidSnapshot(nil)
-        elseif string.find(worldName, "Galleon", 1, true) and
-            WasInRaid and LastRaidInventory ~= nil and not RestoreScheduled then
-            RestoreScheduled = true
-            RestoreAttempts = 0
-            Log("EXTRACT transition detected; saved=" ..
-                InventorySummary(LastRaidInventory))
-            ExecuteWithDelay(1500, RestoreRaidInventory)
-        end
-    end)
-end
-
-local function MonitorExtractionTransition()
-    CheckExtractionTransition()
-    ExecuteWithDelay(SAFETY_SNAPSHOT_INTERVAL_MS, MonitorExtractionTransition)
-end
-
-local function ScheduleExtractionChecks(reason)
-    for _, delay in ipairs(POST_TRAVEL_CHECK_DELAYS_MS) do
-        ExecuteWithDelay(delay, CheckExtractionTransition)
-    end
-end
-
 RegisterLoadMapPreHook(function()
-    ExecuteInGameThread(function()
-        local worldName = ObjectName(CurrentWorld())
-        if string.find(worldName, "MasterMap", 1, true) then
-            SaveRaidSnapshot("before map travel")
-        end
-    end)
+    if WasInRaid and IsValid(RaidInventoryComponent) then
+        SaveRaidSnapshot("before map travel", RaidInventoryComponent)
+    end
 end)
 
-RegisterLoadMapPostHook(function()
-    ScheduleExtractionChecks("map post-load")
-end)
+RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(context)
+    local controller = Unwrap(context)
+    if not IsLocalPlayerController(controller) then return end
 
-RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
-    ScheduleExtractionChecks("client restart")
-end)
+    local worldName = ControllerWorldName(controller)
+    if string.find(worldName, "MasterMap", 1, true) then
+        RaidPlayerController = controller
+        RaidInventoryComponent = nil
+        pcall(function() RaidInventoryComponent = controller.InventoryComponent end)
+        RestorePlayerController = nil
+        RestoreInventoryComponent = nil
+        LastRaidInventory = nil
+        WasInRaid = true
+        RestoreScheduled = false
+        RestoreAttempts = 0
 
-MonitorExtractionTransition()
+        -- One baseline snapshot also covers unusual travel paths where the
+        -- pre-load hook cannot access the old raid component anymore.
+        ExecuteWithDelay(1500, function()
+            if WasInRaid and IsValid(RaidInventoryComponent) then
+                SaveRaidSnapshot("raid started", RaidInventoryComponent)
+            end
+        end)
+    elseif string.find(worldName, "Galleon", 1, true) and
+        WasInRaid and LastRaidInventory ~= nil and not RestoreScheduled then
+        RestorePlayerController = controller
+        RestoreInventoryComponent = nil
+        pcall(function() RestoreInventoryComponent = controller.InventoryComponent end)
+        RestoreScheduled = true
+        RestoreAttempts = 0
+        ExecuteWithDelay(1500, RestoreRaidInventory)
+    end
+end)
