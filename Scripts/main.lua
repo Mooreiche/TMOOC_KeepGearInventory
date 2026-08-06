@@ -1,39 +1,32 @@
-local UEHelpers = require("UEHelpers")
+-- Moor_InventoryKeeper: inventory persistence across successful extraction.
 
-local LOG_PATH =
-    "C:/Program Files (x86)/Steam/steamapps/common/The Mound/TheMound/Binaries/Win64/ue4ss/Mods/" ..
-    "TMOOC_KeepGearInventory-main/TMOOC_KeepGearInventory-main.log"
+local UEHelpers = require("UEHelpers")
 
 local PLAYER_STATE_CLASS = "/Game/TheMound/Blueprints/Game/BP_TMPlayerState.BP_TMPlayerState_C"
 local LastRaidInventory = nil
 local WasInRaid = false
-local DiedThisRaid = false
-local InMasterMap = false
 local RestoreScheduled = false
 local RestoreAttempts = 0
-local DeathHookRegistered = false
 local NativeStoreItemPaths = {}
 local NativeTreasureItemPaths = {}
 local ItemKeepCache = {}
-local ItemInfoCache = {}
 local LastCatalogGameState = nil
+local LastCatalogRefreshAt = 0
+local NormalizedEquipmentLog = {}
+local SAFETY_SNAPSHOT_INTERVAL_MS = 5000
+local POST_TRAVEL_CHECK_DELAYS_MS = { 1000, 2500, 5000, 9000 }
 
+-- Items in Pickups/Other mix real equipment with quest/special objects.  Only
+-- these asset-name fragments belong to the requested Tools & Artifacts or
+-- Support categories.
 local ALLOWED_OTHER_ITEM_MARKERS = {
     "DiviningRod", "Yig", "CurseJar", "Ichor", "Nyarlathotep", "Mask",
     "Crucifix", "Medallion", "SoundBowl", "SlaveFinder", "SmellingSalts",
     "Ammonia", "Map_", "Lantern",
 }
 
-local function Log(message)
-    local line = os.date("%Y-%m-%d %H:%M:%S") ..
-        " [TMOOC_KeepGearInventory-main] " .. tostring(message)
-    print(line .. "\n")
-    local file = io.open(LOG_PATH, "a")
-    if file then
-        file:write(line .. "\n")
-        file:close()
-    end
-end
+-- Detailed diagnostics live in the optional TMOOC_KeepGearInventoryLogger mod.
+local function Log(_) end
 
 local function IsValid(object)
     if object == nil then return false end
@@ -80,20 +73,26 @@ local function RefreshNativeItemSets()
     local gameState = UEHelpers.GetGameStateBase()
     if not IsValid(gameState) then return end
 
+    -- GameState item arrays are static for a map. Reading them once instead of
+    -- on every inventory sample avoids repeated traversal of Unreal arrays.
     local gameStateName = ObjectName(gameState)
     if gameStateName == LastCatalogGameState then return end
+
+    local now = os.clock()
+    if now - LastCatalogRefreshAt < 10 then return end
+    LastCatalogRefreshAt = now
 
     local shopCount = AddArrayItemsToSet(gameState, "ShopItemList", NativeStoreItemPaths)
     local treasureCount = AddArrayItemsToSet(gameState, "TreasureItems", NativeTreasureItemPaths)
     local falseTreasureCount = AddArrayItemsToSet(
         gameState, "FalseTreasureItems", NativeTreasureItemPaths)
 
+    -- Do not cache an early, not-yet-populated GameState during map startup.
     if shopCount ~= nil and shopCount > 0 and
         treasureCount ~= nil and treasureCount > 0 and
         falseTreasureCount ~= nil and falseTreasureCount > 0 then
         LastCatalogGameState = gameStateName
         ItemKeepCache = {}
-        ItemInfoCache = {}
     end
 end
 
@@ -105,6 +104,8 @@ local function ShouldKeepItem(item, fullName, path)
     local cached = ItemKeepCache[path]
     if cached ~= nil then return cached end
 
+    -- Treasure assets are sometimes typed as ZCItemWeapon, so this exclusion
+    -- must run before any weapon, ammo, or native-store checks.
     if string.find(path, "/Blueprints/Pickups/Treasure/", 1, true) ~= nil or
         NativeTreasureItemPaths[path] == true then
         ItemKeepCache[path] = false
@@ -133,20 +134,12 @@ local function ShouldKeepItem(item, fullName, path)
     return keep
 end
 
-local function CachedItemInfo(item)
-    if not IsValid(item) then return nil end
-    local key = tostring(item)
-    local cached = ItemInfoCache[key]
-    if cached ~= nil then return cached end
-
-    local fullName = ObjectName(item)
-    local path = fullName:match("^[^ ]+ (.+)$") or fullName
-    local info = {
-        Path = path,
-        Keep = ShouldKeepItem(item, fullName, path),
-    }
-    ItemInfoCache[key] = info
-    return info
+local function IsSingleItemEquipment(fullName, path)
+    fullName = fullName or ""
+    path = path or ""
+    return string.find(path, "/Blueprints/Pawn/Weapons/", 1, true) ~= nil or
+        string.find(path, "/Blueprints/Pawn/Armor/", 1, true) ~= nil or
+        string.find(fullName, "ZCItemWeapon ", 1, true) == 1
 end
 
 local function FindOrLoadAsset(path)
@@ -157,54 +150,36 @@ local function FindOrLoadAsset(path)
     return StaticFindObject(path)
 end
 
+local function CurrentPlayerController()
+    local controllers = nil
+    pcall(function() controllers = FindAllOf("PlayerController") or FindAllOf("Controller") end)
+    if controllers ~= nil then
+        for _, controller in ipairs(controllers) do
+            if IsValid(controller) then
+                local isLocal = false
+                pcall(function() isLocal = controller:IsLocalPlayerController() end)
+                if isLocal then return controller end
+            end
+        end
+    end
+    return UEHelpers.GetPlayerController()
+end
+
+local function CurrentWorld()
+    local pc = CurrentPlayerController()
+    if IsValid(pc) then
+        local world = nil
+        pcall(function() world = pc:GetWorld() end)
+        if IsValid(world) then return world end
+    end
+    return UEHelpers.GetWorld()
+end
+
 local function CurrentInventoryComponent()
-    local pc = UEHelpers.GetPlayerController()
+    local pc = CurrentPlayerController()
     local inventory = nil
     if IsValid(pc) then pcall(function() inventory = pc.InventoryComponent end) end
     return inventory
-end
-
-local function IsLocalPlayerState(context)
-    context = Unwrap(context)
-    if not IsValid(context) then return false end
-
-    local pc = UEHelpers.GetPlayerController()
-    local playerState = nil
-    if IsValid(pc) then pcall(function() playerState = pc.PlayerState end) end
-    if not IsValid(playerState) then return false end
-    return context == playerState or ObjectName(context) == ObjectName(playerState)
-end
-
-local function DiscardRaidInventory(reason)
-    if LastRaidInventory ~= nil or WasInRaid or RestoreScheduled then
-        Log("DISCARD saved inventory: " .. tostring(reason))
-    end
-    LastRaidInventory = nil
-    WasInRaid = false
-    DiedThisRaid = true
-    RestoreScheduled = false
-    RestoreAttempts = 0
-end
-
-local function RegisterDeathHook()
-    if DeathHookRegistered then return end
-
-    local ok = pcall(function()
-        RegisterHook("/Script/TheMound.TMPlayerState:ServerNotifySpectatingSelf",
-            function(context, spectatingParam)
-                local spectating = Unwrap(spectatingParam)
-                if spectating == true and IsLocalPlayerState(context) then
-                    DiscardRaidInventory("local player died")
-                end
-            end)
-    end)
-
-    if ok then
-        DeathHookRegistered = true
-        Log("Death detection ready.")
-    else
-        ExecuteWithDelay(5000, RegisterDeathHook)
-    end
 end
 
 local function ReadTravelBagInventory()
@@ -229,13 +204,25 @@ local function ReadTravelBagInventory()
             local amount = 0
             pcall(function() item = entry.Item end)
             pcall(function() amount = tonumber(entry.Count) or 0 end)
-            local info = CachedItemInfo(item)
-            if info ~= nil and info.Keep and amount > 0 then
-                table.insert(records, {
-                    Path = info.Path,
-                    Count = amount,
-                    Slot = index,
-                })
+            local fullName = ObjectName(item)
+            local path = fullName:match("^[^ ]+ (.+)$") or fullName
+            if ShouldKeepItem(item, fullName, path) then
+                if IsSingleItemEquipment(fullName, path) then
+                    local logKey = path .. ":" .. tostring(amount)
+                    if amount ~= 1 and not NormalizedEquipmentLog[logKey] then
+                        NormalizedEquipmentLog[logKey] = true
+                        Log("SNAPSHOT normalized equipment count " .. path ..
+                            " from x" .. tostring(amount) .. " to x1")
+                    end
+                    amount = 1
+                end
+                if amount > 0 then
+                    table.insert(records, {
+                        Path = path,
+                        Count = amount,
+                        Slot = index,
+                    })
+                end
             end
         end
     end
@@ -271,13 +258,73 @@ local function InventoryContains(current, expected)
     return true
 end
 
+local function SortedInventoryRecords(records)
+    local sorted = {}
+    if records == nil then return sorted end
+    for _, record in ipairs(records) do table.insert(sorted, record) end
+    table.sort(sorted, function(left, right)
+        return (tonumber(left.Slot) or 0) < (tonumber(right.Slot) or 0)
+    end)
+    return sorted
+end
+
+local function RemoveInventoryRecords(ps, records)
+    local okAll = true
+    for _, record in ipairs(records or {}) do
+        local asset = FindOrLoadAsset(record.Path)
+        if IsValid(asset) and record.Count > 0 then
+            local ok, err = pcall(function()
+                ps:ServerRemoveItemFromInventory(asset, record.Count)
+            end)
+            Log((ok and "RESTORE removed current " or "RESTORE remove failed ") ..
+                "slot=" .. tostring(record.Slot) .. " " .. record.Path ..
+                " x" .. tostring(record.Count) .. (ok and "" or (" error=" .. tostring(err))))
+            okAll = okAll and ok
+        end
+    end
+    return okAll
+end
+
+local function AddInventoryRecords(ps, records, prefix)
+    for _, record in ipairs(SortedInventoryRecords(records)) do
+        local asset = FindOrLoadAsset(record.Path)
+        if IsValid(asset) and record.Count > 0 then
+            local ok, err = pcall(function()
+                ps:ServerAddItemToInventory(asset, record.Count)
+            end)
+            Log((ok and prefix or "RESTORE add failed ") ..
+                "slot=" .. tostring(record.Slot) .. " " .. record.Path ..
+                " x" .. tostring(record.Count) .. (ok and "" or (" error=" .. tostring(err))))
+        else
+            Log("RESTORE asset unavailable " .. record.Path)
+        end
+    end
+end
+
+local function AddMissingInventoryRecords(ps, current, expected)
+    local availableCounts = InventoryCounts(current)
+    for _, record in ipairs(SortedInventoryRecords(expected)) do
+        local available = availableCounts[record.Path] or 0
+        local covered = math.min(available, record.Count)
+        availableCounts[record.Path] = available - covered
+        local missing = record.Count - covered
+        if missing > 0 then
+            AddInventoryRecords(ps, { {
+                Path = record.Path,
+                Count = missing,
+                Slot = record.Slot,
+            } }, "RESTORE added missing ")
+        end
+    end
+end
+
 local function RestoreRaidInventory()
     if LastRaidInventory == nil then
         RestoreScheduled = false
         return
     end
 
-    local pc = UEHelpers.GetPlayerController()
+    local pc = CurrentPlayerController()
     local ps = nil
     if IsValid(pc) then pcall(function() ps = pc.PlayerState end) end
     local current = ReadTravelBagInventory()
@@ -289,25 +336,15 @@ local function RestoreRaidInventory()
 
     Log("RESTORE begin saved=" .. InventorySummary(LastRaidInventory) ..
         " current=" .. InventorySummary(current))
-    local availableCounts = InventoryCounts(current)
-    for _, record in ipairs(LastRaidInventory) do
-        local available = availableCounts[record.Path] or 0
-        local covered = math.min(available, record.Count)
-        availableCounts[record.Path] = available - covered
-        local missing = record.Count - covered
-        if missing > 0 then
-            local asset = FindOrLoadAsset(record.Path)
-            if IsValid(asset) then
-                local ok, err = pcall(function()
-                    ps:ServerAddItemToInventory(asset, missing)
-                end)
-                Log((ok and "RESTORE added " or "RESTORE failed ") ..
-                    "slot=" .. tostring(record.Slot) .. " " .. record.Path ..
-                    " x" .. tostring(missing) .. (ok and "" or (" error=" .. tostring(err))))
-            else
-                Log("RESTORE asset unavailable " .. record.Path)
-            end
-        end
+
+    local removedCurrent = RemoveInventoryRecords(ps, current)
+    if removedCurrent then
+        ExecuteWithDelay(250, function()
+            AddInventoryRecords(ps, LastRaidInventory, "RESTORE added ordered ")
+        end)
+    else
+        Log("RESTORE ordered rebuild skipped; falling back to missing-only restore")
+        AddMissingInventoryRecords(ps, current, LastRaidInventory)
     end
 
     ExecuteWithDelay(1000, function()
@@ -332,59 +369,66 @@ local function RestoreRaidInventory()
     end)
 end
 
-local function CaptureRaidInventory()
-    if DiedThisRaid then return end
+local function SaveRaidSnapshot(reason)
     local snapshot = ReadTravelBagInventory()
     if snapshot ~= nil and next(snapshot) ~= nil then
         LastRaidInventory = snapshot
         WasInRaid = true
+        if reason ~= nil then
+            Log("RAID snapshot saved (" .. tostring(reason) .. ")=" ..
+                InventorySummary(snapshot))
+        end
+        return true
     end
+    if reason ~= nil then
+        Log("RAID snapshot skipped (" .. tostring(reason) .. ")=" ..
+            InventorySummary(snapshot))
+    end
+    return false
+end
+
+local function CheckExtractionTransition()
+    ExecuteInGameThread(function()
+        local worldName = ObjectName(CurrentWorld())
+        if string.find(worldName, "MasterMap", 1, true) then
+            SaveRaidSnapshot(nil)
+        elseif string.find(worldName, "Galleon", 1, true) and
+            WasInRaid and LastRaidInventory ~= nil and not RestoreScheduled then
+            RestoreScheduled = true
+            RestoreAttempts = 0
+            Log("EXTRACT transition detected; saved=" ..
+                InventorySummary(LastRaidInventory))
+            ExecuteWithDelay(1500, RestoreRaidInventory)
+        end
+    end)
 end
 
 local function MonitorExtractionTransition()
+    CheckExtractionTransition()
+    ExecuteWithDelay(SAFETY_SNAPSHOT_INTERVAL_MS, MonitorExtractionTransition)
+end
+
+local function ScheduleExtractionChecks(reason)
+    for _, delay in ipairs(POST_TRAVEL_CHECK_DELAYS_MS) do
+        ExecuteWithDelay(delay, CheckExtractionTransition)
+    end
+end
+
+RegisterLoadMapPreHook(function()
     ExecuteInGameThread(function()
-        local worldName = ObjectName(UEHelpers.GetWorld())
-        local isMasterMap = string.find(worldName, "MasterMap", 1, true) ~= nil
-        local isGalleon = string.find(worldName, "Galleon", 1, true) ~= nil
-
-        if isMasterMap then
-            if not InMasterMap then
-                InMasterMap = true
-                CaptureRaidInventory()
-            end
-        elseif InMasterMap then
-            CaptureRaidInventory()
-            InMasterMap = false
-        end
-
-        if isGalleon then
-            if DiedThisRaid then
-                DiedThisRaid = false
-            elseif WasInRaid and LastRaidInventory ~= nil and not RestoreScheduled then
-                RestoreScheduled = true
-                RestoreAttempts = 0
-                Log("EXTRACT transition detected; saved=" .. InventorySummary(LastRaidInventory))
-                ExecuteWithDelay(1500, RestoreRaidInventory)
-            end
+        local worldName = ObjectName(CurrentWorld())
+        if string.find(worldName, "MasterMap", 1, true) then
+            SaveRaidSnapshot("before map travel")
         end
     end)
-    ExecuteWithDelay(1000, MonitorExtractionTransition)
-end
+end)
 
-local function MonitorRaidInventory()
-    ExecuteInGameThread(function()
-        if InMasterMap then CaptureRaidInventory() end
-    end)
-    ExecuteWithDelay(5000, MonitorRaidInventory)
-end
+RegisterLoadMapPostHook(function()
+    ScheduleExtractionChecks("map post-load")
+end)
 
-local session = io.open(LOG_PATH, "w")
-if session then
-    session:write("TMOOC_KeepGearInventory-main session started " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n")
-    session:close()
-end
+RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
+    ScheduleExtractionChecks("client restart")
+end)
 
 MonitorExtractionTransition()
-MonitorRaidInventory()
-RegisterDeathHook()
-Log("Loaded (production mode).")
