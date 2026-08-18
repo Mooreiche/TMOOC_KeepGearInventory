@@ -11,6 +11,7 @@ local RaidPlayerController = nil
 local RaidInventoryComponent = nil
 local RestorePlayerController = nil
 local RestoreInventoryComponent = nil
+local RaidEndedByDeath = false
 local NativeStoreItemPaths = {}
 local NativeTreasureItemPaths = {}
 local ItemKeepCache = {}
@@ -23,7 +24,7 @@ local NormalizedEquipmentLog = {}
 -- Support categories.
 local ALLOWED_OTHER_ITEM_MARKERS = {
     "DiviningRod", "Yig", "CurseJar", "Ichor", "Nyarlathotep", "Mask",
-    "Crucifix", "Medallion", "SoundBowl", "SlaveFinder",
+    "Crucifix", "Medallion", "SoundBowl", "SlaveFinder", "SmellingSalts",
     "Ammonia", "Map_", "Lantern",
 }
 
@@ -114,13 +115,6 @@ local function ShouldKeepItem(item, fullName, path)
         return false
     end
 
-    -- This special pickup crashes the listen server when reconstructed with
-    -- ServerAddItemToInventory after extraction.
-    if string.find(path, "SmellingSalts", 1, true) ~= nil then
-        ItemKeepCache[path] = false
-        return false
-    end
-
     local isWeapon = string.find(path, "/Blueprints/Pawn/Weapons/", 1, true) ~= nil
     local isArmor = string.find(path, "/Blueprints/Pawn/Armor/", 1, true) ~= nil
     local isAmmo = string.find(fullName, "ZCItemAmmo ", 1, true) == 1 or
@@ -143,12 +137,10 @@ local function ShouldKeepItem(item, fullName, path)
     return keep
 end
 
-local function IsSingleItemEquipment(fullName, path)
-    fullName = fullName or ""
+local function IsSingleItemEquipment(path)
     path = path or ""
     return string.find(path, "/Blueprints/Pawn/Weapons/", 1, true) ~= nil or
-        string.find(path, "/Blueprints/Pawn/Armor/", 1, true) ~= nil or
-        string.find(fullName, "ZCItemWeapon ", 1, true) == 1
+        string.find(path, "/Blueprints/Pawn/Armor/", 1, true) ~= nil
 end
 
 local function FindOrLoadAsset(path)
@@ -230,7 +222,7 @@ local function ReadTravelBagInventory(inventoryOverride)
             local fullName = ObjectName(item)
             local path = fullName:match("^[^ ]+ (.+)$") or fullName
             if ShouldKeepItem(item, fullName, path) then
-                if IsSingleItemEquipment(fullName, path) then
+                if IsSingleItemEquipment(path) then
                     local logKey = path .. ":" .. tostring(amount)
                     if amount ~= 1 and not NormalizedEquipmentLog[logKey] then
                         NormalizedEquipmentLog[logKey] = true
@@ -402,6 +394,7 @@ local function RestoreRaidInventory()
             RaidInventoryComponent = nil
             RestorePlayerController = nil
             RestoreInventoryComponent = nil
+            RaidEndedByDeath = false
         elseif RestoreAttempts < 5 then
             RestoreAttempts = RestoreAttempts + 1
             Log("RESTORE retry=" .. tostring(RestoreAttempts))
@@ -433,8 +426,85 @@ local function SaveRaidSnapshot(reason, inventoryOverride)
     return false
 end
 
+local function RaidPlayerIsDead()
+    if RaidEndedByDeath then return true end
+
+    local playerState = nil
+    if IsValid(RaidPlayerController) then
+        pcall(function() playerState = RaidPlayerController.PlayerState end)
+    end
+    if not IsValid(playerState) then return false end
+
+    local isDead = false
+    pcall(function() isDead = playerState.bIsDead end)
+    return isDead == true
+end
+
+local function CancelRaidRestore(reason)
+    Log("RAID restore cancelled: " .. tostring(reason))
+    LastRaidInventory = nil
+    WasInRaid = false
+    RestoreScheduled = false
+    RestoreAttempts = 0
+    RaidPlayerController = nil
+    RaidInventoryComponent = nil
+    RestorePlayerController = nil
+    RestoreInventoryComponent = nil
+end
+
+local function IsRaidPlayerState(playerState)
+    if not IsValid(playerState) or not IsValid(RaidPlayerController) then return false end
+    local raidPlayerState = nil
+    pcall(function() raidPlayerState = RaidPlayerController.PlayerState end)
+    return IsValid(raidPlayerState) and ObjectName(playerState) == ObjectName(raidPlayerState)
+end
+
+local function MarkLocalPlayerDeath(context)
+    local playerState = Unwrap(context)
+    if WasInRaid and IsRaidPlayerState(playerState) then
+        RaidEndedByDeath = true
+        Log("RAID local player death event detected")
+    end
+end
+
+local function IsDiedMapResult(result)
+    local value = Unwrap(result)
+    if tonumber(value) == 2 then return true end
+    return string.find(string.lower(tostring(value)), "died", 1, true) ~= nil
+end
+
+local function MarkDiedMapResult(_, result)
+    if WasInRaid and IsDiedMapResult(result) then
+        RaidEndedByDeath = true
+        Log("RAID died map result detected")
+    end
+end
+
+pcall(function()
+    RegisterHook(PLAYER_STATE_CLASS .. ":PlayerDeadDispatcher", MarkLocalPlayerDeath)
+end)
+
+pcall(function()
+    RegisterHook(PLAYER_STATE_CLASS .. ":ClientShowGameOverWidget", MarkLocalPlayerDeath)
+end)
+
+pcall(function()
+    RegisterHook("/Script/TheMound.TMDirector:OnMapEnded", MarkDiedMapResult)
+end)
+
+pcall(function()
+    RegisterHook("/Script/TheMound.TMDirector:MulticastOnMapEnded", MarkDiedMapResult)
+end)
+
 RegisterLoadMapPreHook(function()
-    if WasInRaid and IsValid(RaidInventoryComponent) then
+    if not WasInRaid then return end
+
+    if RaidPlayerIsDead() then
+        CancelRaidRestore("death before map travel")
+        return
+    end
+
+    if IsValid(RaidInventoryComponent) then
         SaveRaidSnapshot("before map travel", RaidInventoryComponent)
     end
 end)
@@ -450,6 +520,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(context)
         pcall(function() RaidInventoryComponent = controller.InventoryComponent end)
         RestorePlayerController = nil
         RestoreInventoryComponent = nil
+        RaidEndedByDeath = false
         LastRaidInventory = nil
         WasInRaid = true
         RestoreScheduled = false
@@ -462,13 +533,16 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(context)
                 SaveRaidSnapshot("raid started", RaidInventoryComponent)
             end
         end)
-    elseif string.find(worldName, "Galleon", 1, true) and
-        WasInRaid and LastRaidInventory ~= nil and not RestoreScheduled then
-        RestorePlayerController = controller
-        RestoreInventoryComponent = nil
-        pcall(function() RestoreInventoryComponent = controller.InventoryComponent end)
-        RestoreScheduled = true
-        RestoreAttempts = 0
-        ExecuteWithDelay(1500, RestoreRaidInventory)
+    elseif string.find(worldName, "Galleon", 1, true) and WasInRaid then
+        if RaidPlayerIsDead() then
+            CancelRaidRestore("death detected on ship return")
+        elseif LastRaidInventory ~= nil and not RestoreScheduled then
+            RestorePlayerController = controller
+            RestoreInventoryComponent = nil
+            pcall(function() RestoreInventoryComponent = controller.InventoryComponent end)
+            RestoreScheduled = true
+            RestoreAttempts = 0
+            ExecuteWithDelay(1500, RestoreRaidInventory)
+        end
     end
 end)
